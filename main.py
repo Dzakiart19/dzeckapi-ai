@@ -486,12 +486,23 @@ def _qwen_headers() -> dict:
         h["Cookie"] = cookie_str
     return h
 
-def _qwen_chat(messages: list, model: str = "qwen3.6-plus") -> str:
+def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) -> str:
     """
     Kirim pesan ke chat.qwen.ai tanpa login.
     Flow: POST /api/v2/chats/new → POST /api/v2/chat/completions (SSE).
+    Tools diinjeksi sebagai system prompt agar Qwen bisa menghasilkan tool_calls JSON.
     """
     h = _qwen_headers()
+
+    # Jika tools diberikan, inject ke system message
+    msgs = list(messages)
+    if tools:
+        tool_inject = build_tool_system_prompt(tools)
+        if msgs and msgs[0].get("role") == "system":
+            msgs[0] = {"role": "system", "content": msgs[0]["content"] + "\n\n" + tool_inject}
+        else:
+            msgs.insert(0, {"role": "system", "content": tool_inject})
+
     # Step 1: buat sesi chat baru
     r1 = requests.post("https://chat.qwen.ai/api/v2/chats/new", headers=h, timeout=12,
         json={"title": "New Chat", "models": [model],
@@ -506,7 +517,7 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus") -> str:
     # Step 2: kirim semua messages, ambil hanya konten user terakhir sebagai prompt
     # tapi sertakan history sebagai context (convert format)
     prompt = ""
-    for m in reversed(messages):
+    for m in reversed(msgs):
         if m.get("role") == "user":
             prompt = m.get("content", "")
             break
@@ -1246,7 +1257,7 @@ def run_chat(cfg, messages: list, model_override=None, tools=None):
     """
     model = model_override or cfg["model"]
     if cfg["type"] == "qwen":
-        return _qwen_chat(messages, model=model or cfg["model"])
+        return _qwen_chat(messages, model=model or cfg["model"], tools=tools)
     if cfg["type"] == "pollinations_http":
         r = requests.post(
             "https://text.pollinations.ai/",
@@ -1352,8 +1363,31 @@ def run_chat_fallback(messages: list, model_override=None, require_tool_call: bo
     - tools             : list OpenAI tool definitions
     """
     errors = {}
-    # Pilih urutan berdasarkan intent; pinned provider diletakkan paling depan
-    base_order = get_order_for_intent(intent, pinned=pinned)
+
+    # Jika user memilih provider spesifik (pinned), HANYA gunakan provider itu — tidak ada fallback
+    if pinned and pinned in CHAT_PROVIDERS:
+        print(f"[Routing] PINNED ke '{pinned}' — tidak ada fallback ke provider lain")
+        tier = _provider_tier(pinned)
+        try:
+            print(f"[{tier}] mencoba {pinned} ...")
+            text = run_chat(CHAT_PROVIDERS[pinned], messages, model_override, tools=tools)
+            if not text or not text.strip():
+                return None, None, {pinned: "Respons kosong"}
+            if require_tool_call:
+                _, is_tc = parse_tool_calls(text)
+                if not is_tc:
+                    print(f"[{tier}] {pinned} → tidak menghasilkan tool_calls, kembalikan teks biasa")
+                    # Untuk pinned provider, tetap kembalikan teks meski tidak ada tool_calls
+                    # agar tidak jatuh ke provider lain
+            print(f"[{tier}] {pinned} → sukses ✓")
+            return text, pinned, errors
+        except Exception as e:
+            err_str = str(e)
+            print(f"[{tier}] {pinned} → error: {e}")
+            return None, None, {pinned: err_str}
+
+    # Tidak ada pinned → smart routing normal dengan fallback
+    base_order = get_order_for_intent(intent, pinned=None)
 
     # Saat require_tool_call, dahulukan provider yang tool-capable dalam urutan intent
     if require_tool_call:

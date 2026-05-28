@@ -536,14 +536,9 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
         )
 
     # ── Concurrency control: max 2 Qwen request berjalan bersamaan ──────────
-    # Ini mencegah burst paralel yang trigger rate-limit Qwen.
+    # Semaphore cukup untuk mencegah burst — tidak perlu cooldown tambahan.
     with _QWEN_SEMAPHORE:
-        # Per-model cooldown: jeda min 1.5s antar request model yang sama
-        _qwen_model_cooldown(model, min_gap=1.5)
-        try:
-            return _qwen_do_request(h, model, prompt)
-        finally:
-            _qwen_model_mark_done(model)
+        return _qwen_do_request(h, model, prompt)
 
 
 def _qwen_do_request(h: dict, model: str, prompt: str) -> str:

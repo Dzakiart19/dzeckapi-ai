@@ -525,47 +525,75 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
         raise RuntimeError(f"[Qwen] new chat failed: {d1}")
     chat_id = d1["data"]["id"]
 
-    msg_id = str(uuid.uuid4())
-    payload = {
-        "stream": True, "incremental_output": True,
-        "chat_id": chat_id, "chat_mode": "normal", "model": model,
-        "parent_id": None,
-        "messages": [{
-            "fid": msg_id, "parentId": None, "childrenIds": [],
-            "role": "user", "content": prompt, "user_action": "chat",
-            "files": [], "models": [model], "chat_type": "t2t",
-            "feature_config": {
-                "thinking_enabled": False, "output_schema": "phase", "thinking_budget": 81920
-            },
-            "sub_chat_type": "t2t",
-        }],
-    }
-    r2 = requests.post(
-        f"https://chat.qwen.ai/api/v2/chat/completions?chat_id={chat_id}",
-        headers=h, json=payload, timeout=30,
-    )
-    r2.raise_for_status()
+    # Kirim pesan dengan retry + exponential backoff untuk handle rate limit Qwen
+    _MAX_QWEN_RETRIES = 3
+    _last_qwen_err = None
+    for _attempt in range(_MAX_QWEN_RETRIES):
+        if _attempt > 0:
+            _sleep_sec = 2 ** _attempt  # 2s, 4s
+            print(f"[Qwen] retry ke-{_attempt} setelah {_sleep_sec}s ...")
+            _time_module.sleep(_sleep_sec)
 
-    # Parse SSE stream — kumpulkan delta content dari phase=answer
-    result = []
-    for line in r2.text.split("\n"):
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
+        msg_id = str(uuid.uuid4())
+        payload = {
+            "stream": True, "incremental_output": True,
+            "chat_id": chat_id, "chat_mode": "normal", "model": model,
+            "parent_id": None,
+            "messages": [{
+                "fid": msg_id, "parentId": None, "childrenIds": [],
+                "role": "user", "content": prompt, "user_action": "chat",
+                "files": [], "models": [model], "chat_type": "t2t",
+                "feature_config": {
+                    "thinking_enabled": False, "output_schema": "phase", "thinking_budget": 81920
+                },
+                "sub_chat_type": "t2t",
+            }],
+        }
         try:
-            chunk = json.loads(line[5:].strip())
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            if delta.get("phase") == "answer" and delta.get("content"):
-                result.append(delta["content"])
-        except Exception:
+            r2 = requests.post(
+                f"https://chat.qwen.ai/api/v2/chat/completions?chat_id={chat_id}",
+                headers=h, json=payload, timeout=45,
+            )
+            r2.raise_for_status()
+        except Exception as _req_err:
+            _last_qwen_err = str(_req_err)
             continue
-    text = "".join(result).strip()
-    if not text:
-        raise RuntimeError("[Qwen] respons kosong dari SSE stream")
-    return text
+
+        # Parse SSE stream — prioritas phase=answer, fallback ke semua content
+        result_answer = []
+        result_fallback = []
+        for line in r2.text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                chunk = json.loads(line[5:].strip())
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+                if not content:
+                    continue
+                if delta.get("phase") == "answer":
+                    result_answer.append(content)
+                elif delta.get("phase") not in ("thinking", "search"):
+                    # Fallback: kumpulkan semua non-thinking content
+                    result_fallback.append(content)
+            except Exception:
+                continue
+
+        text = "".join(result_answer).strip()
+        if not text:
+            text = "".join(result_fallback).strip()
+
+        if text:
+            return text
+
+        _last_qwen_err = "respons kosong dari SSE stream"
+        print(f"[Qwen] attempt {_attempt + 1}/{_MAX_QWEN_RETRIES}: SSE kosong, retry ...")
+
+    raise RuntimeError(f"[Qwen] gagal setelah {_MAX_QWEN_RETRIES} percobaan: {_last_qwen_err}")
 
 # ── HF provider definitions (ordered powerful → lightweight) ─────────────────
 _HF_PROVIDERS = [

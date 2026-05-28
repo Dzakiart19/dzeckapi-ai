@@ -530,7 +530,7 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
     _last_qwen_err = None
     for _attempt in range(_MAX_QWEN_RETRIES):
         if _attempt > 0:
-            _sleep_sec = 2 ** _attempt  # 2s, 4s
+            _sleep_sec = 0.5 * _attempt  # 0.5s, 1s — cepat, tidak blocking
             print(f"[Qwen] retry ke-{_attempt} setelah {_sleep_sec}s ...")
             _time_module.sleep(_sleep_sec)
 

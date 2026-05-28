@@ -490,18 +490,29 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
     """
     Kirim pesan ke chat.qwen.ai tanpa login.
     Flow: POST /api/v2/chats/new → POST /api/v2/chat/completions (SSE).
-    Tools diinjeksi sebagai system prompt agar Qwen bisa menghasilkan tool_calls JSON.
+
+    PENTING: Qwen web API hanya menerima 'prompt' (user message terakhir).
+    System messages diabaikan oleh API-nya. Karena itu tools diinjeksi
+    langsung ke dalam user prompt agar benar-benar sampai ke model.
     """
     h = _qwen_headers()
 
-    # Jika tools diberikan, inject ke system message
-    msgs = list(messages)
+    # Ambil user message terakhir sebagai prompt
+    prompt = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            prompt = m.get("content", "")
+            break
+
+    # Inject tool instructions LANGSUNG ke user prompt (bukan system message)
+    # karena Qwen web API tidak mengirim system messages ke model
     if tools:
         tool_inject = build_tool_system_prompt(tools)
-        if msgs and msgs[0].get("role") == "system":
-            msgs[0] = {"role": "system", "content": msgs[0]["content"] + "\n\n" + tool_inject}
-        else:
-            msgs.insert(0, {"role": "system", "content": tool_inject})
+        prompt = (
+            tool_inject
+            + "\n\n---\n## User Request\n"
+            + prompt
+        )
 
     # Step 1: buat sesi chat baru
     r1 = requests.post("https://chat.qwen.ai/api/v2/chats/new", headers=h, timeout=12,
@@ -514,13 +525,6 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
         raise RuntimeError(f"[Qwen] new chat failed: {d1}")
     chat_id = d1["data"]["id"]
 
-    # Step 2: kirim semua messages, ambil hanya konten user terakhir sebagai prompt
-    # tapi sertakan history sebagai context (convert format)
-    prompt = ""
-    for m in reversed(msgs):
-        if m.get("role") == "user":
-            prompt = m.get("content", "")
-            break
     msg_id = str(uuid.uuid4())
     payload = {
         "stream": True, "incremental_output": True,
@@ -1127,16 +1131,17 @@ When using tools, follow the tool-calling format exactly as instructed."""
 
 # ── Tool calling system prompt (diinjeksi untuk g4f providers) ─────────────────
 TOOL_SYSTEM_INJECT = """\
-You have access to the following tools/functions:
+You are a function-calling AI. The tools below are INSTALLED and READY — \
+you can call them right now by outputting JSON. You do NOT need internet access \
+to call tools; just output the JSON and the system will execute them for you.
 
 <tools>
 {tools_json}
 </tools>
 
-## Tool Calling Rules
+## MANDATORY OUTPUT FORMAT when calling a tool
 
-When you need to call a tool, respond with ONLY a raw JSON object — no explanation, \
-no markdown, no code block, no text before or after:
+Output ONLY this raw JSON — zero explanation, zero markdown, zero text before or after:
 
 {{"tool_calls": [
   {{
@@ -1144,24 +1149,23 @@ no markdown, no code block, no text before or after:
     "type": "function",
     "function": {{
       "name": "<tool_name>",
-      "arguments": "<json_string_of_args>"
+      "arguments": "<json_encoded_string_of_arguments>"
     }}
   }}
 ]}}
 
-### Parallel calls (when multiple tools are needed at once):
-{{"tool_calls": [
-  {{"id": "call_{rand_id}a", "type": "function", "function": {{"name": "<tool1>", "arguments": "<args1>"}}}},
-  {{"id": "call_{rand_id}b", "type": "function", "function": {{"name": "<tool2>", "arguments": "<args2>"}}}}
-]}}
+Example for a weather tool with location="Jakarta":
+{{"tool_calls": [{{"id": "call_{rand_id}", "type": "function", "function": {{"name": "get_weather", "arguments": "{{\"location\": \"Jakarta\"}}"}}}}]}}
 
-### Rules:
-1. If a tool is needed → output ONLY the JSON above, nothing else.
-2. If no tool is needed → reply normally in plain text.
-3. NEVER mix tool call JSON with plain text in the same response.
-4. NEVER wrap the JSON in markdown (no ```json blocks).
-5. The "arguments" field MUST be a JSON-encoded string, not a raw object.
-6. Only call tools that are listed above. Never invent tool names.
+## STRICT RULES — NO EXCEPTIONS:
+1. If the user's request matches a tool → output ONLY the JSON tool call. Nothing else.
+2. NEVER say "I don't have access", "I cannot", or "please check another service" \
+when a relevant tool exists — CALL THE TOOL instead.
+3. NEVER wrap JSON in markdown code blocks (no ```json).
+4. NEVER add any text before or after the JSON.
+5. The "arguments" value MUST be a JSON-encoded string (escape inner quotes).
+6. Only call tools listed above. Never invent tool names.
+7. If no tool matches the request → reply normally in plain text.
 """
 
 def build_tool_system_prompt(tools: list, forced_tool_name: str = None) -> str:

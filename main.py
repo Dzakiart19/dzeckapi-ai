@@ -10,6 +10,7 @@ import secrets
 import hashlib
 import functools
 import urllib.parse
+import threading
 import requests
 from huggingface_hub import InferenceClient as HFClient
 import redis
@@ -486,6 +487,26 @@ def _qwen_headers() -> dict:
         h["Cookie"] = cookie_str
     return h
 
+# ── Qwen concurrency control ──────────────────────────────────────────────────
+# Batasi max 2 request Qwen berjalan bersamaan agar tidak trigger rate limit.
+_QWEN_SEMAPHORE = threading.Semaphore(2)
+# Cooldown per-model: catat timestamp terakhir selesai, paksa jeda min 1.5s.
+_qwen_model_last_done: dict = {}
+_qwen_model_lock = threading.Lock()
+
+def _qwen_model_cooldown(model: str, min_gap: float = 1.5):
+    """Tunggu hingga min_gap detik berlalu sejak request model ini selesai."""
+    with _qwen_model_lock:
+        last = _qwen_model_last_done.get(model, 0.0)
+        wait = min_gap - (time.time() - last)
+    if wait > 0:
+        print(f"[Qwen] cooldown {model}: tunggu {wait:.2f}s ...")
+        time.sleep(wait)
+
+def _qwen_model_mark_done(model: str):
+    with _qwen_model_lock:
+        _qwen_model_last_done[model] = time.time()
+
 def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) -> str:
     """
     Kirim pesan ke chat.qwen.ai tanpa login.
@@ -514,6 +535,19 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
             + prompt
         )
 
+    # ── Concurrency control: max 2 Qwen request berjalan bersamaan ──────────
+    # Ini mencegah burst paralel yang trigger rate-limit Qwen.
+    with _QWEN_SEMAPHORE:
+        # Per-model cooldown: jeda min 1.5s antar request model yang sama
+        _qwen_model_cooldown(model, min_gap=1.5)
+        try:
+            return _qwen_do_request(h, model, prompt)
+        finally:
+            _qwen_model_mark_done(model)
+
+
+def _qwen_do_request(h: dict, model: str, prompt: str) -> str:
+    """Lakukan request + SSE parse ke Qwen (dipanggil dalam semaphore)."""
     # Step 1: buat sesi chat baru
     r1 = requests.post("https://chat.qwen.ai/api/v2/chats/new", headers=h, timeout=12,
         json={"title": "New Chat", "models": [model],
@@ -525,12 +559,12 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
         raise RuntimeError(f"[Qwen] new chat failed: {d1}")
     chat_id = d1["data"]["id"]
 
-    # Kirim pesan dengan retry + exponential backoff untuk handle rate limit Qwen
+    # Step 2: kirim pesan dengan retry
     _MAX_QWEN_RETRIES = 3
     _last_qwen_err = None
     for _attempt in range(_MAX_QWEN_RETRIES):
         if _attempt > 0:
-            _sleep_sec = 0.5 * _attempt  # 0.5s, 1s — cepat, tidak blocking
+            _sleep_sec = 0.5 * _attempt  # 0.5s, 1s
             print(f"[Qwen] retry ke-{_attempt} setelah {_sleep_sec}s ...")
             _time_module.sleep(_sleep_sec)
 
@@ -578,7 +612,6 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
                 if delta.get("phase") == "answer":
                     result_answer.append(content)
                 elif delta.get("phase") not in ("thinking", "search"):
-                    # Fallback: kumpulkan semua non-thinking content
                     result_fallback.append(content)
             except Exception:
                 continue

@@ -507,7 +507,7 @@ def _qwen_model_mark_done(model: str):
     with _qwen_model_lock:
         _qwen_model_last_done[model] = time.time()
 
-def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) -> str:
+def _qwen_chat(messages: list, model: str = "qwen3.7-max", tools: list = None) -> str:
     """
     Kirim pesan ke chat.qwen.ai tanpa login.
     Flow: POST /api/v2/chats/new → POST /api/v2/chat/completions (SSE).
@@ -538,7 +538,29 @@ def _qwen_chat(messages: list, model: str = "qwen3.6-plus", tools: list = None) 
     # ── Concurrency control: max 2 Qwen request berjalan bersamaan ──────────
     # Semaphore cukup untuk mencegah burst — tidak perlu cooldown tambahan.
     with _QWEN_SEMAPHORE:
-        return _qwen_do_request(h, model, prompt)
+        result = _qwen_do_request(h, model, prompt)
+
+    # ── Auto-retry jika tools dikirim tapi hasilnya plain text ───────────────
+    # Qwen kadang balas teks biasa meski ada tools → agent loop macet.
+    # Retry sekali dengan prompt ultra-paksa.
+    if tools:
+        _, is_tc = parse_tool_calls(result)
+        if not is_tc:
+            print(f"[Qwen] {model} → plain text saat tools ada, retry paksa tool call ...")
+            force_suffix = (
+                "\n\n## ⚠️ CRITICAL OVERRIDE ⚠️\n"
+                "You responded with plain text above. That is WRONG.\n"
+                "You MUST output ONLY the JSON tool_calls. No explanation. No text.\n"
+                "Look at the tools list above and pick the correct tool NOW.\n"
+                "Output ONLY:\n"
+                '{"tool_calls": [{"id": "call_retry", "type": "function", '
+                '"function": {"name": "<tool_name>", "arguments": "<json_args>"}}]}'
+            )
+            forced_prompt = prompt + force_suffix
+            with _QWEN_SEMAPHORE:
+                result = _qwen_do_request(h, model, forced_prompt)
+
+    return result
 
 
 def _qwen_do_request(h: dict, model: str, prompt: str) -> str:
@@ -584,6 +606,18 @@ def _qwen_do_request(h: dict, model: str, prompt: str) -> str:
                 headers=h, json=payload, timeout=45,
             )
             r2.raise_for_status()
+            # Qwen kadang return HTTP 200 tapi body-nya JSON error (bukan SSE)
+            # Tandanya: x-actual-status-code != 200, atau body tidak ada "data:"
+            actual_code = r2.headers.get("x-actual-status-code", "200")
+            if str(actual_code) != "200":
+                try:
+                    err_body = r2.json()
+                    err_detail = err_body.get("data", {}).get("details") or err_body.get("data", {}).get("code") or str(err_body)
+                except Exception:
+                    err_detail = r2.text[:100]
+                _last_qwen_err = f"Qwen API error {actual_code}: {err_detail}"
+                print(f"[Qwen] {model} → HTTP 200 tapi actual={actual_code}: {err_detail}")
+                continue
         except Exception as _req_err:
             _last_qwen_err = str(_req_err)
             continue
@@ -745,23 +779,30 @@ if G4F_AVAILABLE:
         if _gp["tool_cap"]:
             TOOL_CAPABLE_ORDER.append(_gp["id"])
 
-# ── Qwen AI keyless providers (chat.qwen.ai) — 3 tier model ──────────────────
+# ── Qwen AI keyless providers (chat.qwen.ai) — valid model names (verified) ──
+# Valid per Mei 2026: qwen3.7-max, qwen3-30b-a3b, qwen3-235b-a22b
+# INVALID (404): qwen3.5-flash, qwen3.6-plus, qwen-max, qwen-plus, qwen-turbo
 if _QWEN_COOKIES_AVAILABLE:
     _QWEN_CHAT_PROVIDERS = [
         {
             "id":    "qwen-flash",
-            "model": "qwen3.5-flash",
-            "desc":  "Qwen3.5-Flash via chat.qwen.ai — free, cepat, tanpa login",
+            "model": "qwen3-30b-a3b",
+            "desc":  "Qwen3-30B via chat.qwen.ai — free, cepat, tanpa login",
         },
         {
             "id":    "qwen-plus",
-            "model": "qwen3.6-plus",
-            "desc":  "Qwen3.6-Plus via chat.qwen.ai — free, balanced, tanpa login",
+            "model": "qwen3-30b-a3b",
+            "desc":  "Qwen3-30B via chat.qwen.ai — free, balanced, tanpa login",
         },
         {
             "id":    "qwen-max",
             "model": "qwen3.7-max",
             "desc":  "Qwen3.7-Max via chat.qwen.ai — free, paling kuat, tanpa login",
+        },
+        {
+            "id":    "qwen-large",
+            "model": "qwen3-235b-a22b",
+            "desc":  "Qwen3-235B via chat.qwen.ai — free, terkuat, tanpa login",
         },
     ]
     for _qp in _QWEN_CHAT_PROVIDERS:
@@ -806,9 +847,10 @@ _PUBLIC_LABEL: dict[str, str] = {
     # Pollinations
     "pollinations-gptoss": "GPT-OSS-20B",
     # Qwen AI keyless
-    "qwen-flash": "Qwen3.5-Flash",
-    "qwen-plus":  "Qwen3.6-Plus",
+    "qwen-flash": "Qwen3-30B",
+    "qwen-plus":  "Qwen3-30B",
     "qwen-max":   "Qwen3.7-Max",
+    "qwen-large": "Qwen3-235B",
     # G4F keyless
     "g4f-deepinfra":   "Llama-3-8B",
     "g4f-yqcloud":     "Yqcloud-GPT",
